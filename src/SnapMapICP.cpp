@@ -314,12 +314,17 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
 
         sensor_msgs::PointCloud cloud;
         sensor_msgs::PointCloud cloudInMap;
-
+        //接收激光扫描数据并输出相应的二维点云数据
         projector_->projectLaser(*scan_in,cloud);
 
         we_have_a_scan = false;
         bool gotTransform = false;
 
+        /*
+        等待获取到从激光雷达坐标系到地图坐标系和从基座坐标系到地图坐标系的变换，这是为了将从激光雷达坐标系
+        获取到的点云转换到地图坐标系中。如果等待时间超过了0.05秒，则会输出警告信息，并释放scan_callback_mutex，
+        返回。这样做是为了避免在等待时间过长时，程序一直被锁住，无法继续执行。
+        */
         if (!listener_->waitForTransform("/map", cloud.header.frame_id, cloud.header.stamp, ros::Duration(0.05)))
         {
             scan_callback_mutex.unlock();
@@ -334,12 +339,19 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
             return;
         }
 
-
+        //将激光雷达数据 cloud 转换到地图坐标系上，以进行地图匹配
         while (!gotTransform && (ros::ok()))
         {
             try
             {
                 gotTransform = true;
+                /*
+                将激光雷达点云数据从激光雷达的坐标系转换到地图（/map）的坐标系。在这个函数中，
+                使用了tf库中的transformPointCloud函数，该函数用于进行点云坐标系的变换。它需要传入三个参数：
+                目标坐标系的名称、待转换的点云和存储转换后点云的变量。在函数内部，通过读取tf树来计算目标坐标系
+                和待转换点云坐标系之间的变换关系，并将待转换点云中的点按照计算得到的变换关系进行坐标系变换，
+                最终将变换后的点云存储在指定的存储变量中。
+                */
                 listener_->transformPointCloud ("/map",cloud,cloudInMap);
             }
             catch (...)
@@ -348,7 +360,8 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
                 ROS_WARN("DIDNT GET TRANSFORM IN A");
             }
         }
-
+        //将 cloudInMap 中所有点的 z 坐标设为 0，以实现在地图平面上进行匹配。
+        //如果没有得到变换，则 cloudInMap 为空，不会执行 z 坐标设置操作。
         for (size_t k =0; k < cloudInMap.points.size(); k++)
         {
             cloudInMap.points[k].z = 0;
@@ -363,6 +376,7 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
             try
             {
                 gotTransform = true;
+                //获取机器人相对于"map"坐标系的位姿，将获取到的位姿信息存储在oldPose中，以便在下一次扫描时计算机器人位姿变化。
                 listener_->lookupTransform("map", "base_link",
                                            cloud.header.stamp , oldPose);
             }
@@ -379,17 +393,11 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
 
             actScan++;
 
-            //pcl::IterativeClosestPointNonLinear<pcl::PointXYZ, pcl::PointXYZ> reg;
+            //初始化并运行迭代最近点 （ICP） 算法，以对齐地图的点云和新的激光扫描。
             pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> reg;
             reg.setTransformationEpsilon (1e-6);
-            // Set the maximum distance between two correspondences (src<->tgt) to 10cm
-            // Note: adjust this based on the size of your datasets
             reg.setMaxCorrespondenceDistance(5);
             reg.setMaximumIterations (ICP_NUM_ITER);
-            // Set the point representation
-
-            //ros::Time bef = ros::Time::now();
-
             PointCloudT::Ptr myMapCloud (new PointCloudT());
             PointCloudT::Ptr myScanCloud (new PointCloudT());
 
@@ -407,7 +415,12 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
             Eigen::Matrix4f transf = reg.getFinalTransformation();
             std::cout << "transf : " << std::endl;
             std::cout << transf << std::endl;
-
+            /*
+            提取出变换矩阵的旋转部分，即3x3的旋转矩阵。
+            将旋转矩阵转换为欧拉角表示，并对yaw轴的旋转角度进行缩放，即将yaw轴的旋转角度乘以0.1。
+            将缩放后的欧拉角重新转换为旋转矩阵，用于替换原先变换矩阵中的旋转部分。
+            最后输出变换矩阵，其中旋转部分已经经过缩放和替换后更新。
+            */
             const Eigen::Matrix3f rotation_matrix = transf.block(0,0,3,3);  //从欧拉矩阵获取旋转矩阵
             std::cout << "rotation_matrix : " << std::endl;
             std::cout << rotation_matrix << std::endl;
@@ -423,7 +436,7 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
                             Eigen::AngleAxisf(eulerAngle[2], Eigen::Vector3f::UnitZ());
             std::cout << "rotation_matri_after =\n" << rotation_matri_after << std::endl; 
 
-
+            //用新的旋转矩阵更新变换矩阵的左上角 3x3 矩阵块，同时保持矩阵的平移分量不变
             transf.block(0,0,3,3) = rotation_matri_after;
             // transf(0,3) *= 0.2;
             // transf(1,3) *= 0.2;
@@ -432,17 +445,19 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
 
 
 
-            tf::Transform t_result;     
+            tf::Transform t_result;   
+            //将 4x4 转换矩阵转换为对象的函数  
             matrixAsTransfrom(transf,t_result);
-            // std::cout << "t_result : " << std::endl;
-            // std::cout << &t_result << std::endl;
-
-            //ROS_ERROR("proc time %f", (ros::Time::now() - bef).toSec());
-
             we_have_a_scan_transformed = false;
             PointCloudT transformedCloud;
+            /*
+            将输入的点云 myScanCloud 应用了变换矩阵 reg.getFinalTransformation() 进行变换，
+            并将结果存储在输出点云 transformedCloud 中。这是ICP算法的核心部分，通过将扫描点云
+            对齐到地图点云的方法，实现对地图的更新。
+            */
             pcl::transformPointCloud (*myScanCloud, transformedCloud, reg.getFinalTransformation());
 
+            //计算转换后的点云中内数的百分比。
             double inlier_perc = 0;
             {
                 // count inliers
@@ -467,13 +482,18 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
 
             pcl::toROSMsg (transformedCloud, cloud2transformed);
             we_have_a_scan_transformed = true;
-
+            /*
+            计算机器人从上一次扫描到现在所移动的距离和旋转角度，并根据这个位姿变化更新机器人的位置信息t_result，
+            最后使用旧的机器人位姿oldPose与新的位姿t_result进行矩阵乘法，以获取机器人的最终位姿。
+            */
             double dist = sqrt((t_result.getOrigin().x() * t_result.getOrigin().x()) + (t_result.getOrigin().y() * t_result.getOrigin().y()));
             double angleDist = t_result.getRotation().getAngle();
             tf::Vector3 rotAxis  = t_result.getRotation().getAxis();
+            //第二个t_result是在执行ICP匹配过程中计算所得的相对运动位姿,每次通过ICP匹配后，都会得到一个相对变换参数，
+            //即机器人运动的相对位移，用来更新当前的机器人位姿信息。
             t_result =  t_result * oldPose;
 
-            //-----------------------------------
+            //获取机器人相对于里程计坐标系（/odom）的位姿信息，进行变换操作以更新机器人当前的全局位置信息。
             tf::StampedTransform odom_to_base_after;
             if (!getTransform(odom_to_base_after, ODOM_FRAME, "base_link", ros::Time(0)))
             {
@@ -483,7 +503,8 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
                 return;
             }
             else
-            {
+            {   
+                //计算了机器人在odom坐标系下的运动
                 tf::Transform rel = odom_to_base_before.inverseTimes(odom_to_base_after);
                 ROS_DEBUG("relative motion of robot while doing icp: %fcm %fdeg", rel.getOrigin().length(), rel.getRotation().getAngle() * 180 / M_PI);
                 t_result= t_result * rel;
@@ -536,7 +557,7 @@ void scanCallback (const sensor_msgs::LaserScan::ConstPtr& scan_in)
 
 ros::Time paramsWereUpdated;
 
-
+//从ROS参数服务器中读取算法所需的各种参数。
 void updateParams()
 {
     paramsWereUpdated = ros::Time::now();
@@ -617,19 +638,19 @@ int main(int argc, char** argv)
 
         // 广播map与base_link坐标系之间的tf数据
         br.sendTransform(tf::StampedTransform(transform_map_baselink, ros::Time::now(), "map", ODOM_FRAME));
-        //法ROS_INFO("send tranform from map to base_link......");
-        //-------------------------------------------
 
+   
+        //如果当前收到的激光雷达数据序号(actScan)大于上一次处理的序号(lastScan)，则执行激光配准并发布处理结果。
         if (actScan > lastScan)
         {
             lastScan = actScan;
-            // publish map as a pointcloud2
+            //如果已经成功获取了地图点云数据(we_have_a_map为真)，我们将其以PointCloud2格式发送至map_points话题（通过pub_output_），以便在RViz中查看
             if (we_have_a_map)
               pub_output_.publish(output_cloud);
-            // publish scan as seen as a pointcloud2
+            //如果已经成功获取了激光扫描数据(we_have_a_scan为真)，我们将其以PointCloud2格式发送至scan_points话题中（通过pub_output_scan），以可视化查看扫描效果
             if (we_have_a_scan)
                pub_output_scan.publish(cloud2);
-            // publish icp transformed scan
+            //cloud2transformed存储的是经过坐标变换后的点云数据。
             if (we_have_a_scan_transformed)
                 pub_output_scan_transformed.publish(cloud2transformed);
         }
